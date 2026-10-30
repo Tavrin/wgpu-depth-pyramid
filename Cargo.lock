@@ -375,13 +375,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
-name = "wgpu-depth-pyramid"
-version = "0.1.0"
-dependencies = [
- "wgpu",
-]
-
-[[package]]
 name = "naga"
 version = "30.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -987,6 +980,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7586165fd5f6d881cb9ce4bb71f40d6caab2c0f1837e3fc1d9788a197fb6004f"
 dependencies = [
  "wgpu-hal",
+]
+
+[[package]]
+name = "wgpu-depth-pyramid"
+version = "0.2.0"
+dependencies = [
+ "wgpu",
 ]
 
 [[package]]

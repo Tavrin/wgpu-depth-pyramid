@@ -5,20 +5,73 @@
 use std::{fmt, num::NonZeroU64};
 use wgpu::util::DeviceExt;
 
+mod ao;
 mod legacy_shader;
 pub mod reference;
 mod shader;
 
 /// Reduction is explicit: a reverse-Z depth has larger values nearer the camera.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Reduction {
     /// Farthest surface in reverse-Z; appropriate for conservative occlusion tests.
     Min,
     /// Closest surface in reverse-Z; appropriate for hierarchical ray marching.
     Max,
+    /// Reverse-Z depth-aware weighted downsample for screen-space ambient occlusion.
+    /// Uses the f32 formula and clamped 2x2 edge rule in the crate documentation.
+    /// GPU identity is bit-exact against the ported reference shader on the same
+    /// adapter. CPU comparisons use the propagated 2.5-ULP-per-division bound
+    /// documented in [`reference::build`].
+    Ao {
+        /// Finite nonnegative radius in the same units as the source depth.
+        effect_radius: f32,
+        /// Fraction of the radius over which weights fall off, in [0, 1].
+        effect_falloff_range: f32,
+    },
+}
+
+impl Reduction {
+    pub(crate) const AO: Self = Self::Ao {
+        effect_radius: 0.5,
+        effect_falloff_range: 0.615,
+    };
+
+    pub(crate) fn is_ao(self) -> bool {
+        matches!(self, Self::Ao { .. })
+    }
+
+    fn pipeline_key(self) -> Self {
+        if self.is_ao() {
+            Self::AO
+        } else {
+            self
+        }
+    }
+
+    pub(crate) fn validate(self) -> Result<(), Error> {
+        if let Self::Ao {
+            effect_radius,
+            effect_falloff_range,
+        } = self
+        {
+            let radius = 0.75 * effect_radius;
+            let range = (effect_falloff_range * radius).max(1e-5);
+            let add = radius * (1.0 - effect_falloff_range) / range + 1.0;
+            if !effect_radius.is_finite()
+                || effect_radius < 0.0
+                || !(0.0..=1.0).contains(&effect_falloff_range)
+                || !add.is_finite()
+            {
+                return Err(Error("AO requires a finite nonnegative radius, falloff in [0,1], and finite derived coefficients"));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Source rectangle, in texels. Output mip zero is an exact copy of this rectangle.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Viewport {
     /// Origin of the source rectangle, in texels.
@@ -27,7 +80,15 @@ pub struct Viewport {
     pub size: [u32; 2],
 }
 
+impl Viewport {
+    /// Construct a source rectangle. Bounds are checked when preparing a pyramid.
+    pub const fn new(offset: [u32; 2], size: [u32; 2]) -> Self {
+        Self { offset, size }
+    }
+}
+
 /// Invalid setup. GPU validation still applies to device ownership and texture usages.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Error(
     /// Human-readable setup failure.
@@ -74,13 +135,14 @@ pub fn mip_sizes(size: [u32; 2]) -> Result<Vec<[u32; 2]>, Error> {
 }
 
 /// Explicit implementation choice. `Auto` uses the measured resolution policy.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Strategy {
     /// Use fused paths at 1080p, 1440p and 4K; scalar elsewhere.
     Auto,
-    /// Conventional 8x8, one pass per mip, persistent parameters/bindings.
+    /// Conventional 8x8, one dispatch per mip, persistent parameters/bindings.
     Naive,
-    /// Copy and first reduction in registers, then conventional per-mip passes.
+    /// Copy and first reduction in registers, then conventional per-mip dispatches.
     Merged,
     /// Tile-local reductions; tile is a source tile (32 or 64), depth is 2..=6.
     /// A 32-wide tile supports at most five reductions.
@@ -120,7 +182,7 @@ struct Variant {
     pipeline: wgpu::ComputePipeline,
 }
 
-/// Pipelines compiled once for both source formats and reductions.
+/// Pipelines compiled once for both source formats and all reductions.
 /// Requires only WebGPU default limits and no optional features.
 pub struct PyramidKernel {
     variants: Vec<Variant>,
@@ -144,7 +206,7 @@ impl PyramidKernel {
                 if mode == Mode::Merged && !copy {
                     continue;
                 }
-                for reduction in [Reduction::Min, Reduction::Max] {
+                for reduction in [Reduction::Min, Reduction::Max, Reduction::AO] {
                     let max_count = match mode {
                         Mode::Scalar => 1,
                         Mode::Merged => 2,
@@ -175,7 +237,7 @@ impl PyramidKernel {
                                 ty: wgpu::BindingType::Buffer {
                                     ty: wgpu::BufferBindingType::Uniform,
                                     has_dynamic_offset: false,
-                                    min_binding_size: NonZeroU64::new(32),
+                                    min_binding_size: NonZeroU64::new(48),
                                 },
                                 count: None,
                             },
@@ -278,10 +340,12 @@ impl PyramidKernel {
         reduction: Reduction,
         strategy: Strategy,
     ) -> Result<Pyramid, Error> {
+        reduction.validate()?;
         let strategy = match strategy {
             Strategy::Auto => match viewport.size {
-                [1920, 1080] => Strategy::FusedMerged { tile: 32, depth: 5 },
-                [2560, 1440] | [3840, 2160] => Strategy::FusedMerged { tile: 32, depth: 4 },
+                [1920, 1080] | [2560, 1440] | [3840, 2160] => {
+                    Strategy::FusedMerged { tile: 32, depth: 4 }
+                }
                 _ => Strategy::Naive,
             },
             other => other,
@@ -386,7 +450,7 @@ impl PyramidKernel {
                     v.mode == mode
                         && v.depth == (depth && copy)
                         && v.copy == copy
-                        && v.reduction == reduction
+                        && v.reduction == reduction.pipeline_key()
                         && v.count == count
                 })
                 .unwrap();
@@ -409,6 +473,13 @@ impl PyramidKernel {
                     mapped_at_creation: false,
                 })
             });
+            let (radius, falloff) = match reduction {
+                Reduction::Ao {
+                    effect_radius,
+                    effect_falloff_range,
+                } => (effect_radius, effect_falloff_range),
+                _ => (0.0f32, 0.0f32),
+            };
             let words = [
                 src_size[0],
                 src_size[1],
@@ -418,6 +489,10 @@ impl PyramidKernel {
                 sizes[start][1],
                 pitch4,
                 offset5,
+                radius.to_bits(),
+                falloff.to_bits(),
+                0,
+                0,
             ];
             let bytes: Vec<_> = words.into_iter().flat_map(u32::to_le_bytes).collect();
             let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -511,42 +586,70 @@ pub struct Pyramid {
     strategy: Strategy,
 }
 impl Pyramid {
-    /// Record the entire chain. No host allocations, new resources or uploads.
-    /// Dispatch boundaries are separate compute passes to establish texture visibility.
+    /// Record the complete chain in one compute pass by default.
+    /// Bindings and parameters are preallocated. Each dispatch is a separate
+    /// WebGPU usage scope; wgpu inserts storage-write to sampled-read barriers.
+    /// Explicit strategies with staged levels split only at buffer-to-texture
+    /// copies, which cannot be encoded inside a compute pass.
     pub fn record(&self, encoder: &mut wgpu::CommandEncoder) {
-        self.record_inner(encoder, None);
+        self.record_inner(encoder, None, false);
     }
+
+    /// Record one compute pass per dispatch, for profiling and comparison.
+    /// Uses the same preallocated pipelines, bind groups and output texture.
+    pub fn record_separate_passes(&self, encoder: &mut wgpu::CommandEncoder) {
+        self.record_inner(encoder, None, true);
+    }
+
     /// Per-dispatch timestamps for profiling; requires TIMESTAMP_QUERY.
-    /// Each dispatch uses two queries, beginning at `first_query`.
+    /// Each dispatch uses a separate pass and two queries, beginning at `first_query`.
     pub fn record_profiled(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         queries: &wgpu::QuerySet,
         first_query: u32,
     ) {
-        self.record_inner(encoder, Some((queries, first_query)));
+        self.record_inner(encoder, Some((queries, first_query)), true);
     }
+
     fn record_inner(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         timestamps: Option<(&wgpu::QuerySet, u32)>,
+        separate: bool,
     ) {
-        for (i, step) in self.steps.iter().enumerate() {
+        let mut start = 0;
+        while start < self.steps.len() {
+            let end = if separate {
+                start + 1
+            } else {
+                self.steps[start..]
+                    .iter()
+                    .position(|step| step.spill.is_some())
+                    .map_or(self.steps.len(), |i| start + i + 1)
+            };
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("pyramid dispatch"),
-                    timestamp_writes: timestamps.map(|(q, start)| {
+                    label: Some("pyramid chain"),
+                    timestamp_writes: timestamps.map(|(q, first)| {
                         wgpu::ComputePassTimestampWrites {
                             query_set: q,
-                            beginning_of_pass_write_index: Some(start + 2 * i as u32),
-                            end_of_pass_write_index: Some(start + 2 * i as u32 + 1),
+                            beginning_of_pass_write_index: Some(
+                                first + 2 * u32::try_from(start).expect("mip index fits u32"),
+                            ),
+                            end_of_pass_write_index: Some(
+                                first + 2 * u32::try_from(start).expect("mip index fits u32") + 1,
+                            ),
                         }
                     }),
                 });
-                pass.set_pipeline(&step.pipeline);
-                pass.set_bind_group(0, &step.bindings, &[]);
-                pass.dispatch_workgroups(step.groups[0], step.groups[1], 1);
+                for step in &self.steps[start..end] {
+                    pass.set_pipeline(&step.pipeline);
+                    pass.set_bind_group(0, &step.bindings, &[]);
+                    pass.dispatch_workgroups(step.groups[0], step.groups[1], 1);
+                }
             }
+            let step = &self.steps[end - 1];
             if let Some(spill) = &step.spill {
                 for &(mip, size, pitch, offset) in &step.spill_levels {
                     encoder.copy_buffer_to_texture(
@@ -572,8 +675,19 @@ impl Pyramid {
                     );
                 }
             }
+            start = end;
         }
     }
+
+    /// Compute passes used by [`Self::record`], excluding timestamp profiling.
+    /// Automatic strategies use one pass. Explicit staged strategies split at copies.
+    pub fn compute_pass_count(&self) -> usize {
+        1 + self.steps[..self.steps.len() - 1]
+            .iter()
+            .filter(|step| step.spill.is_some())
+            .count()
+    }
+
     /// Resolved implementation choice; never `Strategy::Auto`.
     pub fn strategy(&self) -> Strategy {
         self.strategy
@@ -594,7 +708,7 @@ impl Pyramid {
     pub fn staged_copy_count(&self) -> usize {
         self.steps.iter().map(|step| step.spill_levels.len()).sum()
     }
-    /// Number of compute dispatches (and compute passes) per recording.
+    /// Number of compute dispatches per recording, independent of pass grouping.
     pub fn dispatch_count(&self) -> usize {
         self.steps.len()
     }

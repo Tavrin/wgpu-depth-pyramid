@@ -1,4 +1,6 @@
 #![forbid(unsafe_code)]
+#[path = "support/ao_bounds.rs"]
+mod ao_bounds;
 #[path = "support/naive.rs"]
 mod naive;
 mod support;
@@ -74,7 +76,7 @@ fn profile(gpu: &support::Gpu, pyramid: &Pyramid, size: [u32; 2], reduction: Red
             );
         }
         println!(
-            "dispatch,{size:?},{reduction:?},{:?},{step},{:.3}",
+            "dispatch_separate_passes,{size:?},{reduction:?},{:?},{step},{:.3}",
             pyramid.strategy(),
             median(&mut times)
         );
@@ -83,6 +85,14 @@ fn profile(gpu: &support::Gpu, pyramid: &Pyramid, size: [u32; 2], reduction: Red
 fn main() {
     let gpu = support::Gpu::new(true);
     let kernel = PyramidKernel::new(&gpu.device);
+    let ao_run = std::env::args().any(|arg| arg == "--ao");
+    let verification = if ao_run {
+        "CPU-WGSL-bound+GPU-bitwise"
+    } else {
+        "CPU-bitwise+GPU-bitwise"
+    };
+    println!("verification={verification}");
+    eprintln!("verification={verification}");
     let final_run = std::env::args().any(|arg| arg == "--final");
     println!(
         "adapter={:?}; default_limits={:?}",
@@ -104,12 +114,18 @@ fn main() {
     for size in [[1920, 1080], [2560, 1440], [3840, 2160]] {
         let data = support::depths(size, 0);
         let source = gpu.source(size, &data, false);
-        for reduction in [Reduction::Min, Reduction::Max] {
-            let viewport = Viewport {
-                offset: [0, 0],
-                size,
-            };
-            let expected = reference::build(&data, size, viewport, reduction).unwrap();
+        let reductions = if ao_run {
+            vec![Reduction::Ao {
+                effect_radius: 0.5,
+                effect_falloff_range: 0.615,
+            }]
+        } else {
+            vec![Reduction::Min, Reduction::Max]
+        };
+        for reduction in reductions {
+            let viewport = Viewport::new([0, 0], size);
+            let cpu_expected = reference::build(&data, size, viewport, reduction).unwrap();
+            let bounds = ao_run.then(|| ao_bounds::build(&cpu_expected, reduction));
             let library_naive = kernel
                 .prepare_with_strategy(&gpu.device, &source, viewport, reduction, Strategy::Naive)
                 .unwrap();
@@ -130,20 +146,30 @@ fn main() {
                 baseline.record(&mut encoder);
                 library_naive.record(&mut encoder);
                 gpu.queue.submit([encoder.finish()]);
+                let expected = gpu.read_chain(&baseline.texture, &baseline.sizes);
                 for actual in [
                     gpu.read_chain(pyramid.texture(), pyramid.sizes()),
                     gpu.read_chain(&baseline.texture, &baseline.sizes),
                     gpu.read_chain(library_naive.texture(), library_naive.sizes()),
                 ] {
                     assert_eq!(actual.len(), expected.len());
-                    for (a, e) in actual.iter().zip(&expected) {
-                        assert_eq!(a.len(), e.texels.len());
-                        for (i, (&a, e)) in a.iter().zip(&e.texels).enumerate() {
+                    for (level, (a, e)) in actual.iter().zip(&expected).enumerate() {
+                        assert_eq!(a.len(), e.len());
+                        for (i, (&a, &e)) in a.iter().zip(e).enumerate() {
                             assert_eq!(
-                                a,
-                                e.to_bits(),
-                                "{size:?} {reduction:?} {strategy:?} texel={i}"
+                                a, e,
+                                "{size:?} {reduction:?} {strategy:?} mip={level} texel={i}"
                             );
+                            let cpu = cpu_expected[level].texels[i];
+                            if let Some(bounds) = &bounds {
+                                let error = (f64::from(f32::from_bits(a)) - f64::from(cpu)).abs();
+                                assert!(
+                                    error <= bounds[level][i].tolerance(cpu),
+                                    "AO CPU tolerance mip={level} texel={i}"
+                                );
+                            } else {
+                                assert_eq!(a, cpu.to_bits(), "min/max CPU identity");
+                            }
                         }
                     }
                 }

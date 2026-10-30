@@ -1,5 +1,5 @@
 use wgpu::util::DeviceExt;
-use wgpu_depth_pyramid::{mip_sizes, Reduction};
+use wgpu_depth_pyramid::{mip_sizes, Reduction, Viewport};
 
 // A deliberately conventional baseline: a distinct compute pass and 8x8 dispatch
 // per mip, with all uniforms and bindings prepared before timing (a strong baseline).
@@ -9,11 +9,29 @@ pub struct Naive {
     steps: Vec<(wgpu::ComputePipeline, wgpu::BindGroup, [u32; 2])>,
 }
 impl Naive {
+    #[allow(dead_code)]
     pub fn new(device: &wgpu::Device, source: &wgpu::Texture, reduction: Reduction) -> Self {
-        let sizes = mip_sizes([source.width(), source.height()]).unwrap();
+        Self::with_viewport(
+            device,
+            source,
+            Viewport::new([0, 0], [source.width(), source.height()]),
+            reduction,
+        )
+    }
+    pub fn with_viewport(
+        device: &wgpu::Device,
+        source: &wgpu::Texture,
+        viewport: Viewport,
+        reduction: Reduction,
+    ) -> Self {
+        let sizes = mip_sizes(viewport.size).unwrap();
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("naive pyramid"),
-            size: source.size(),
+            size: wgpu::Extent3d {
+                width: viewport.size[0],
+                height: viewport.size[1],
+                depth_or_array_layers: 1,
+            },
             mip_level_count: sizes.len() as u32,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -23,50 +41,63 @@ impl Naive {
                 | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
-        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: None,
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::StorageTexture {
-                        access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: wgpu::TextureFormat::R32Float,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: std::num::NonZeroU64::new(16),
-                    },
-                    count: None,
-                },
-            ],
-        });
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: None,
-            bind_group_layouts: &[Some(&layout)],
-            immediate_size: 0,
-        });
-        let pipelines: Vec<_> = [true, false]
+        let layouts: Vec<_> = [true, false]
             .into_iter()
             .map(|copy| {
-                let code = include_str!("naive.wgsl")
+                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: None,
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: if copy
+                                    && source.format() == wgpu::TextureFormat::Depth32Float
+                                {
+                                    wgpu::TextureSampleType::Depth
+                                } else {
+                                    wgpu::TextureSampleType::Float { filterable: false }
+                                },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::StorageTexture {
+                                access: wgpu::StorageTextureAccess::WriteOnly,
+                                format: wgpu::TextureFormat::R32Float,
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: std::num::NonZeroU64::new(32),
+                            },
+                            count: None,
+                        },
+                    ],
+                })
+            })
+            .collect();
+        let pipelines: Vec<_> = [true, false]
+            .into_iter()
+            .enumerate()
+            .map(|(i, copy)| {
+                let pipeline_layout =
+                    device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: None,
+                        bind_group_layouts: &[Some(&layouts[i])],
+                        immediate_size: 0,
+                    });
+                let mut code = include_str!("naive.wgsl")
                     .replace("COPY_BASE", if copy { "true" } else { "false" })
                     .replace(
                         "REDUCE",
@@ -76,6 +107,16 @@ impl Naive {
                             "max"
                         },
                     );
+                if let Reduction::Ao { .. } = reduction {
+                    code = include_str!("ao_reference.wgsl")
+                        .replace("COPY_BASE", if copy { "true" } else { "false" })
+                        .replace("COMPONENT", ".r");
+                }
+                if copy && source.format() == wgpu::TextureFormat::Depth32Float {
+                    code = code
+                        .replace("texture_2d<f32>", "texture_depth_2d")
+                        .replace("0).r", "0)");
+                }
                 let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                     label: Some("naive WGSL"),
                     source: wgpu::ShaderSource::Wgsl(code.into()),
@@ -99,16 +140,36 @@ impl Naive {
                 })
             })
             .collect();
-        let source_view = source.create_view(&Default::default());
+        let source_view = source.create_view(&wgpu::TextureViewDescriptor {
+            mip_level_count: Some(1),
+            array_layer_count: Some(1),
+            ..Default::default()
+        });
         let steps = sizes
             .iter()
             .enumerate()
             .map(|(i, size)| {
                 let src_size = sizes[i.saturating_sub(1)];
-                let bytes: Vec<_> = [src_size[0], src_size[1], size[0], size[1]]
-                    .into_iter()
-                    .flat_map(u32::to_le_bytes)
-                    .collect();
+                let (radius, falloff) = match reduction {
+                    Reduction::Ao {
+                        effect_radius,
+                        effect_falloff_range,
+                    } => (effect_radius, effect_falloff_range),
+                    _ => (0.0f32, 0.0f32),
+                };
+                let bytes: Vec<_> = [
+                    src_size[0],
+                    src_size[1],
+                    size[0],
+                    size[1],
+                    radius.to_bits(),
+                    falloff.to_bits(),
+                    viewport.offset[0],
+                    viewport.offset[1],
+                ]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect();
                 let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: None,
                     contents: &bytes,
@@ -116,7 +177,7 @@ impl Naive {
                 });
                 let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: None,
-                    layout: &layout,
+                    layout: &layouts[usize::from(i != 0)],
                     entries: &[
                         wgpu::BindGroupEntry {
                             binding: 0,
