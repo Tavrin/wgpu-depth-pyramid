@@ -1,0 +1,18 @@
+[package]
+name = "wgpu-depth-pyramid"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+description = "Fast min/max depth (Hi-Z) mip pyramids for wgpu, in WGSL, WebGPU-compatible"
+repository = "https://github.com/Tavrin/wgpu-depth-pyramid"
+readme = "README.md"
+keywords = ["wgpu", "hi-z", "depth", "occlusion-culling", "webgpu"]
+categories = ["graphics", "rendering"]
+include = ["Cargo.toml", "Cargo.lock", "src/**", "examples/**", "tests/**", "README.md", "CHANGELOG.md", "LICENSE-MIT", "LICENSE-APACHE"]
+
+[lib]
+name = "wgpu_depth_pyramid"
+
+[dependencies]
+wgpu = "30"

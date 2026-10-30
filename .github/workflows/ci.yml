@@ -1,0 +1,25 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: CPU tests and doctests (GPU tests remain ignored)
+        run: cargo test --locked
+      - name: Naga validation
+        run: cargo test --lib --locked shaders_validate
+      - name: WebGPU build
+        run: cargo build --target wasm32-unknown-unknown --locked
+      - name: Public text
+        run: bash tools/check_public_text.sh
