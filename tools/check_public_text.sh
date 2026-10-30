@@ -6,7 +6,7 @@ private='mo''ss'
 planning='rf''c'
 pattern="/home/[a-z]+/|/mnt/[a-z]|${private}-(scratch|cargo|heavy|coord|lane|capture)|automation_game|etienne|Legion-Pro|\b${private}\b|${planning} ?[0-9]|${private}-[a-z0-9]{5}|freelancer|harry.?potter"
 set +e
-rg --hidden --no-ignore -n -i "$pattern" . --glob '!.git/**' --glob '!target/**' --glob '!tools/check_public_text.sh'
+grep -rnIEi "$pattern" . --exclude-dir=.git --exclude-dir=target --exclude=check_public_text.sh
 status=$?
 set -e
 case "$status" in
