@@ -1,10 +1,10 @@
 [package]
 name = "wgpu-depth-pyramid"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
-description = "Fast min/max depth (Hi-Z) mip pyramids for wgpu, in WGSL, WebGPU-compatible"
+description = "Fast min/max and ambient-occlusion depth mip pyramids for wgpu, in WGSL, WebGPU-compatible"
 repository = "https://github.com/Tavrin/wgpu-depth-pyramid"
 readme = "README.md"
 keywords = ["wgpu", "hi-z", "depth", "occlusion-culling", "webgpu"]

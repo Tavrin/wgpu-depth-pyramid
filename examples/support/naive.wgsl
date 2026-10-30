@@ -1,4 +1,4 @@
-struct Params { src_size: vec2<u32>, size: vec2<u32> }
+struct Params { src_size: vec2<u32>, size: vec2<u32>, radius: f32, falloff: f32, offset: vec2<u32> }
 @group(0) @binding(0) var source: texture_2d<f32>;
 @group(0) @binding(1) var output: texture_storage_2d<r32float, write>;
 @group(0) @binding(2) var<uniform> params: Params;
@@ -7,7 +7,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p = gid.xy;
     if any(p >= params.size) { return; }
     if COPY_BASE {
-        textureStore(output, vec2<i32>(p), textureLoad(source, vec2<i32>(p), 0));
+        textureStore(output, vec2<i32>(p), vec4<f32>(textureLoad(source, vec2<i32>(p + params.offset), 0).r));
         return;
     }
     let start = min(p * 2u, params.src_size - 1u);

@@ -1,4 +1,5 @@
 #![cfg(not(target_arch = "wasm32"))]
+mod common;
 #[path = "../examples/support/mod.rs"]
 mod support;
 use wgpu_depth_pyramid::{reference, PyramidKernel, Reduction, Viewport};
@@ -8,43 +9,7 @@ use wgpu_depth_pyramid::{reference, PyramidKernel, Reduction, Viewport};
 fn every_mip_bit_exact() {
     let gpu = support::Gpu::new(false);
     let kernel = PyramidKernel::new(&gpu.device);
-    let mut cases = vec![
-        [1, 1],
-        [1, 2],
-        [2, 1],
-        [1, 4097],
-        [4097, 1],
-        [2, 3],
-        [3, 2],
-        [3, 5],
-        [7, 9],
-        [8, 8],
-        [9, 15],
-        [15, 17],
-        [16, 16],
-        [17, 31],
-        [31, 33],
-        [32, 32],
-        [33, 63],
-        [63, 65],
-        [64, 64],
-        [65, 127],
-        [127, 129],
-        [128, 128],
-        [129, 255],
-        [255, 257],
-        [257, 129],
-        [1920, 1080],
-        [2560, 1440],
-        [3840, 2160],
-        [4097, 2049],
-    ];
-    // Random small rectangles exercise unequal folding remainders at every fused boundary.
-    let mut state = 12345u32;
-    for _ in 0..32 {
-        state = state.wrapping_mul(1664525).wrapping_add(1013904223);
-        cases.push([1 + state % 300, 1 + (state >> 16) % 300]);
-    }
+    let cases = common::sizes();
     let mut comparisons = 0u64;
     let mut chains = 0;
     for size in cases {
@@ -55,7 +20,7 @@ fn every_mip_bit_exact() {
             } else {
                 [size[0] + offset[0] + 2, size[1] + offset[1] + 1]
             };
-            let viewport = Viewport { offset, size };
+            let viewport = Viewport::new(offset, size);
             for pattern in 0..10 {
                 let mut data = support::depths(source_size, pattern);
                 if matches!(pattern, 6 | 7) {
@@ -94,6 +59,7 @@ fn every_mip_bit_exact() {
                         let pyramid = kernel
                             .prepare(&gpu.device, &source, viewport, reduction)
                             .unwrap();
+                        assert_eq!(pyramid.compute_pass_count(), 1);
                         let mut encoder = gpu.device.create_command_encoder(&Default::default());
                         pyramid.record(&mut encoder);
                         gpu.queue.submit([encoder.finish()]);
@@ -115,10 +81,7 @@ fn every_mip_bit_exact() {
         eprintln!("PASS size={size:?}, cumulative chains={chains}, texels={comparisons}");
     }
     // Repeated recording, source content updates and resource recreation at resize.
-    let viewport = Viewport {
-        offset: [0, 0],
-        size: [17, 19],
-    };
+    let viewport = Viewport::new([0, 0], [17, 19]);
     let source = gpu.source(viewport.size, &[0.0; 17 * 19], false);
     let pyramid = kernel
         .prepare(&gpu.device, &source, viewport, Reduction::Max)
@@ -148,10 +111,7 @@ fn every_mip_bit_exact() {
         .prepare(
             &gpu.device,
             &source,
-            Viewport {
-                offset: [1, 0],
-                size: [17, 19]
-            },
+            Viewport::new([1, 0], [17, 19]),
             Reduction::Min
         )
         .is_err());
@@ -194,7 +154,7 @@ fn explicit_variants_fold_boundaries() {
     ] {
         for offset in [[0, 0], [3, 5]] {
             let source_size = [size[0] + offset[0], size[1] + offset[1]];
-            let viewport = Viewport { offset, size };
+            let viewport = Viewport::new(offset, size);
             for pattern in [0, 4, 5, 6, 7] {
                 let data = support::depths(source_size, pattern);
                 for depth in [false, true] {
@@ -249,4 +209,48 @@ fn explicit_variants_fold_boundaries() {
         eprintln!("VARIANT PASS size={size:?} chains={chains} comparisons={comparisons}");
     }
     eprintln!("VARIANT TOTAL chains={chains} comparisons={comparisons}");
+}
+
+#[test]
+#[ignore = "requires a hardware GPU under an exclusive GPU lease"]
+fn one_pass_storage_to_sampled_dependencies_match_separate_passes() {
+    use wgpu_depth_pyramid::Strategy;
+    let gpu = support::Gpu::new(false);
+    let kernel = PyramidKernel::new(&gpu.device);
+    let size = [1920, 1080];
+    let data = support::depths(size, 0);
+    for depth in [false, true] {
+        let source = gpu.source(size, &data, depth);
+        for reduction in [
+            Reduction::Min,
+            Reduction::Max,
+            Reduction::Ao {
+                effect_radius: 0.5,
+                effect_falloff_range: 0.615,
+            },
+        ] {
+            for strategy in [Strategy::Auto, Strategy::Naive, Strategy::Legacy] {
+                let pyramid = kernel
+                    .prepare_with_strategy(
+                        &gpu.device,
+                        &source,
+                        Viewport::new([0, 0], size),
+                        reduction,
+                        strategy,
+                    )
+                    .unwrap();
+                assert_eq!(pyramid.compute_pass_count(), 1);
+                assert_eq!(pyramid.staged_copy_count(), 0);
+                let mut encoder = gpu.device.create_command_encoder(&Default::default());
+                pyramid.record(&mut encoder);
+                gpu.queue.submit([encoder.finish()]);
+                let one = gpu.read_chain(pyramid.texture(), pyramid.sizes());
+                let mut encoder = gpu.device.create_command_encoder(&Default::default());
+                pyramid.record_separate_passes(&mut encoder);
+                gpu.queue.submit([encoder.finish()]);
+                let separate = gpu.read_chain(pyramid.texture(), pyramid.sizes());
+                assert_eq!(one, separate, "{reduction:?} {strategy:?} depth={depth}");
+            }
+        }
+    }
 }

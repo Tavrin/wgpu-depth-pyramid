@@ -230,10 +230,7 @@ pub fn run() {
     for size in [[1920, 1080], [2560, 1440], [3840, 2160]] {
         let data = support::depths(size, 0);
         let source = gpu.source(size, &data, true);
-        let viewport = Viewport {
-            offset: [0, 0],
-            size,
-        };
+        let viewport = Viewport::new([0, 0], size);
         let full = mip_sizes(size).unwrap().len();
         let refs = [
             Chain::new(&gpu.device, &source, full, &copy, &reduce, [1, 0, 0, 0]),
@@ -244,10 +241,7 @@ pub fn run() {
                 .prepare_with_strategy(&gpu.device, &source, viewport, r, Strategy::Naive)
                 .unwrap()
         });
-        let strategy = Strategy::FusedMerged {
-            tile: 32,
-            depth: if size == [1920, 1080] { 5 } else { 4 },
-        };
+        let strategy = Strategy::FusedMerged { tile: 32, depth: 4 };
         let fused = [Reduction::Min, Reduction::Max]
             .map(|r| kernel.prepare(&gpu.device, &source, viewport, r).unwrap());
         assert!(fused.iter().all(|p| p.strategy() == strategy));
@@ -308,7 +302,7 @@ pub fn run() {
         for a in &ao[1..] {
             assert_eq!(gpu.read_chain(&a.texture, &a.sizes), ao_ref);
         }
-        println!("configuration,{size:?},min_mips={full},max_mips={full},ao_mips=5,reference_passes={},scalar_passes={},fused_passes={},fused_staged_copies={},strategy={strategy:?}; min/max CPU bitwise and AO cross-arm bitwise PASS",full*2+5,scalar.iter().map(|p|p.dispatch_count()).sum::<usize>()+5,fused.iter().map(|p|p.dispatch_count()).sum::<usize>()+5,fused.iter().map(|p|p.staged_copy_count()).sum::<usize>());
+        println!("configuration,{size:?},min_mips={full},max_mips={full},ao_mips=5,reference_passes={},scalar_passes={},fused_passes={},fused_staged_copies={},strategy={strategy:?}; min/max CPU bitwise and AO cross-arm bitwise PASS",full*2+5,scalar.iter().map(|p|p.compute_pass_count()).sum::<usize>()+5,fused.iter().map(|p|p.compute_pass_count()).sum::<usize>()+5,fused.iter().map(|p|p.staged_copy_count()).sum::<usize>());
         for frame in 0..8 {
             let mut encoder = gpu.device.create_command_encoder(&Default::default());
             for k in 0..3 {

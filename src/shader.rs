@@ -3,7 +3,7 @@ use crate::Reduction;
 fn header(depth: bool, reduction: Reduction, count: u32) -> String {
     let mut s = format!(
         r#"
-struct Params {{ src_size: vec2<u32>, offset: vec2<u32>, first_size: vec2<u32>, pitch4: u32, offset5: u32 }}
+struct Params {{ src_size: vec2<u32>, offset: vec2<u32>, first_size: vec2<u32>, pitch4: u32, offset5: u32, effect_radius: f32, effect_falloff_range: f32, pad: vec2<u32> }}
 @group(0) @binding(0) var source: {texture};
 @group(0) @binding(1) var<uniform> params: Params;
 fn combine(a: u32, b: u32) -> u32 {{ return {op}(a,b); }}
@@ -14,17 +14,22 @@ fn end_cell(p: vec2<u32>, src: vec2<u32>, dst: vec2<u32>) -> vec2<u32> {{
 fn reduce_source(p: vec2<u32>) -> u32 {{
     let a = min(p*2u, params.src_size-1u);
     let b = min(a+1u, params.src_size-1u);
-    var v = combine(combine(load(a),load(vec2<u32>(b.x,a.y))), combine(load(vec2<u32>(a.x,b.y)),load(b)));
-    let end = end_cell(p, params.src_size, params.first_size);
-    if end.x > a.x+2u {{
-        for (var y=a.y; y<end.y; y++) {{ v=combine(v,load(vec2<u32>(a.x+2u,y))); }}
-    }}
-    if end.y > a.y+2u {{
-        for (var x=a.x; x<min(a.x+2u,end.x); x++) {{ v=combine(v,load(vec2<u32>(x,a.y+2u))); }}
-    }}
-    return v;
+{reduce_source}
 }}
 "#,
+        reduce_source = if reduction.is_ao() {
+            "    return quad(load(a),load(vec2<u32>(b.x,a.y)),load(vec2<u32>(a.x,b.y)),load(b));"
+        } else {
+            r#"    var v = combine(combine(load(a),load(vec2<u32>(b.x,a.y))), combine(load(vec2<u32>(a.x,b.y)),load(b)));
+    let end = end_cell(p, params.src_size, params.first_size);
+    if end.x > a.x+2u {
+        for (var y=a.y; y<end.y; y++) { v=combine(v,load(vec2<u32>(a.x+2u,y))); }
+    }
+    if end.y > a.y+2u {
+        for (var x=a.x; x<min(a.x+2u,end.x); x++) { v=combine(v,load(vec2<u32>(x,a.y+2u))); }
+    }
+    return v;"#
+        },
         texture = if depth {
             "texture_depth_2d"
         } else {
@@ -37,6 +42,9 @@ fn reduce_source(p: vec2<u32>) -> u32 {{
             "max"
         }
     );
+    if reduction.is_ao() {
+        s.push_str(crate::ao::QUAD);
+    }
     for i in 0..count.min(4) {
         s.push_str(&format!(
             "@group(0) @binding({}) var out{i}: texture_storage_2d<r32float,write>;\n",
@@ -103,10 +111,12 @@ pub(crate) fn merged(depth: bool, reduction: Reduction) -> String {
             let q=vec2<u32>(x,begin.y+2u); let a=load(q); store0(q,a); v=combine(v,a);
         }
     }
-    store1(p,v);
-}
 "#,
     );
+    if reduction.is_ao() {
+        s.push_str("v=quad(v00,v10,v01,v11);\n");
+    }
+    s.push_str("store1(p,v); }\n");
     s
 }
 
@@ -138,6 +148,35 @@ pub(crate) fn fused(reduction: Reduction, count: u32, tile: u32) -> String {
 "#,first_tile=tile/2));
     if register_stage == 0 {
         s.push_str("let value=reduce_source(base+p); store0(base+p,value);\n");
+    } else if reduction.is_ao() {
+        // Retain all first-level texels, including tails that AO does not filter.
+        // Compute the four parent inputs once and preserve their raster order.
+        s.push_str(
+            r#"
+        let begin=min(p*2u,extent-1u); let end=end_cell(p,extent,reg_size);
+        let b=min(begin+1u,extent-1u);
+        let v00=reduce_source(base+begin);
+        let v10=reduce_source(base+vec2<u32>(b.x,begin.y));
+        let v01=reduce_source(base+vec2<u32>(begin.x,b.y));
+        let v11=reduce_source(base+b);
+        store0(base+begin,v00);
+        if b.x!=begin.x { store0(base+vec2<u32>(b.x,begin.y),v10); }
+        if b.y!=begin.y { store0(base+vec2<u32>(begin.x,b.y),v01); }
+        if all(b!=begin) { store0(base+b,v11); }
+        if end.x>begin.x+2u {
+            for(var y=begin.y; y<end.y; y++) {
+                let q=base+vec2<u32>(begin.x+2u,y); store0(q,reduce_source(q));
+            }
+        }
+        if end.y>begin.y+2u {
+            for(var x=begin.x; x<min(begin.x+2u,end.x); x++) {
+                let q=base+vec2<u32>(x,begin.y+2u); store0(q,reduce_source(q));
+            }
+        }
+        let value=quad(v00,v10,v01,v11);
+        store1((base/2u)+p,value);
+"#,
+        );
     } else {
         s.push_str(r#"
         let begin=min(p*2u,extent-1u); let end=end_cell(p,extent,reg_size);
@@ -169,12 +208,17 @@ pub(crate) fn fused(reduction: Reduction, count: u32, tile: u32) -> String {
     for(var i=lane; i<size{stage}.x*size{stage}.y; i+=256u) {{
         let p=vec2<u32>(i%size{stage}.x,i/size{stage}.x);
         let begin=min(p*2u,prev{stage}-1u); let end=end_cell(p,prev{stage},size{stage});
-        var value=scratch[{previous}u+begin.y*{prev_width}u+begin.x];
+{reduce_shared}        store{stage}((base >> vec2<u32>({stage}u))+p,value);
+"#,
+            reduce_shared = if reduction.is_ao() {
+                format!("let b=min(begin+1u,prev{stage}-1u);\nlet value=quad(scratch[{previous}u+begin.y*{prev_width}u+begin.x],scratch[{previous}u+begin.y*{prev_width}u+b.x],scratch[{previous}u+b.y*{prev_width}u+begin.x],scratch[{previous}u+b.y*{prev_width}u+b.x]);\n")
+            } else {
+                format!(r#"        var value=scratch[{previous}u+begin.y*{prev_width}u+begin.x];
         for(var y=begin.y; y<end.y; y++) {{ for(var x=begin.x; x<end.x; x++) {{
             value=combine(value,scratch[{previous}u+y*{prev_width}u+x]);
         }}}}
-        store{stage}((base >> vec2<u32>({stage}u))+p,value);
-"#,
+"#)
+            },
             prev_stage = stage - 1
         ));
         if stage + 1 < count {
@@ -208,7 +252,7 @@ mod tests {
     }
     #[test]
     fn shaders_validate() {
-        for reduction in [Reduction::Min, Reduction::Max] {
+        for reduction in [Reduction::Min, Reduction::Max, Reduction::AO] {
             for depth in [false, true] {
                 for copy in [false, true] {
                     validate(&scalar(depth, copy, reduction));
